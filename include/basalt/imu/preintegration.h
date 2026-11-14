@@ -294,6 +294,99 @@ class IntegratedImuMeasurement {
     return res;
   }
 
+  /// @brief Residual of plans/gravity_scale_optimisation.md §2.3.1 with
+  /// gravity vector g_D in the estimator world and a scale, and optionally
+  /// its Jacobians, including those with respect to g_D and log(scale).
+  VecN residualGS(const PoseVelState<Scalar>& state0, const Vec3& g_D,
+                  const PoseVelState<Scalar>& state1, const Vec3& curr_bg,
+                  const Vec3& curr_ba, Scalar scale,
+                  MatNN* d_res_d_state0 = nullptr,
+                  MatNN* d_res_d_state1 = nullptr, MatN3* d_res_d_bg = nullptr,
+                  MatN3* d_res_d_ba = nullptr, MatN3* d_res_d_gD = nullptr,
+                  VecN* d_res_d_logscale = nullptr) const {
+    Scalar dt = delta_state_.t_ns * Scalar(1e-9);
+    VecN res;
+
+    VecN bg_diff;
+    VecN ba_diff;
+    bg_diff = d_state_d_bg_ * (curr_bg - bias_gyro_lin_);
+    ba_diff = d_state_d_ba_ * (curr_ba - bias_accel_lin_);
+
+    BASALT_ASSERT(ba_diff.template segment<3>(3).isApproxToConstant(0));
+
+    const Vec3 dpos = state1.T_w_i.translation() -
+                      state0.T_w_i.translation() - state0.vel_w_i * dt;
+    const Vec3 dvel = state1.vel_w_i - state0.vel_w_i;
+
+    Mat3 R0_inv = state0.T_w_i.so3().inverse().matrix();
+    Vec3 tmp = R0_inv * (scale * dpos - Scalar(0.5) * g_D * dt * dt);
+
+    res.template segment<3>(0) =
+        tmp - (delta_state_.T_w_i.translation() +
+               bg_diff.template segment<3>(0) + ba_diff.template segment<3>(0));
+    res.template segment<3>(3) =
+        (SO3::exp(bg_diff.template segment<3>(3)) * delta_state_.T_w_i.so3() *
+         state1.T_w_i.so3().inverse() * state0.T_w_i.so3())
+            .log();
+
+    Vec3 tmp2 = R0_inv * (scale * dvel - g_D * dt);
+    res.template segment<3>(6) =
+        tmp2 - (delta_state_.vel_w_i + bg_diff.template segment<3>(6) +
+                ba_diff.template segment<3>(6));
+
+    if (d_res_d_state0 || d_res_d_state1) {
+      Mat3 J;
+      Sophus::rightJacobianInvSO3(res.template segment<3>(3), J);
+
+      if (d_res_d_state0) {
+        d_res_d_state0->setZero();
+        d_res_d_state0->template block<3, 3>(0, 0) = -scale * R0_inv;
+        d_res_d_state0->template block<3, 3>(0, 3) = SO3::hat(tmp) * R0_inv;
+        d_res_d_state0->template block<3, 3>(3, 3) = J * R0_inv;
+        d_res_d_state0->template block<3, 3>(6, 3) = SO3::hat(tmp2) * R0_inv;
+
+        d_res_d_state0->template block<3, 3>(0, 6) = -scale * R0_inv * dt;
+        d_res_d_state0->template block<3, 3>(6, 6) = -scale * R0_inv;
+      }
+
+      if (d_res_d_state1) {
+        d_res_d_state1->setZero();
+        d_res_d_state1->template block<3, 3>(0, 0) = scale * R0_inv;
+        d_res_d_state1->template block<3, 3>(3, 3) = -J * R0_inv;
+
+        d_res_d_state1->template block<3, 3>(6, 6) = scale * R0_inv;
+      }
+    }
+
+    if (d_res_d_ba) {
+      *d_res_d_ba = -d_state_d_ba_;
+    }
+
+    if (d_res_d_bg) {
+      d_res_d_bg->setZero();
+      *d_res_d_bg = -d_state_d_bg_;
+
+      Mat3 J;
+      Sophus::leftJacobianInvSO3(res.template segment<3>(3), J);
+      d_res_d_bg->template block<3, 3>(3, 0) =
+          J * d_state_d_bg_.template block<3, 3>(3, 0);
+    }
+
+    if (d_res_d_gD) {
+      d_res_d_gD->setZero();
+      d_res_d_gD->template block<3, 3>(0, 0) = Scalar(-0.5) * dt * dt * R0_inv;
+      d_res_d_gD->template block<3, 3>(6, 0) = -dt * R0_inv;
+    }
+
+    if (d_res_d_logscale) {
+      d_res_d_logscale->setZero();
+      d_res_d_logscale->template segment<3>(0) = scale * R0_inv * dpos;
+      d_res_d_logscale->template segment<3>(6) = scale * R0_inv * dvel;
+    }
+
+    return res;
+  }
+
   /// @brief Time duretion of preintegrated measurement in nanoseconds.
   int64_t get_dt_ns() const { return delta_state_.t_ns; }
 
